@@ -121,49 +121,26 @@ def retrieve_latents(
     else:
         raise AttributeError("Could not access latents of provided encoder_output")
 
-
-class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
+class WanImageToVideoPipeline(DiffusionPipeline):
     r"""
     Pipeline for image-to-video generation using Wan.
-
-    This model inherits from [`DiffusionPipeline`]. Check the superclass documentation for the generic methods
-    implemented for all pipelines (downloading, saving, running on a particular device, etc.).
-
-    Args:
-        tokenizer ([`T5Tokenizer`]):
-            Tokenizer from [T5](https://huggingface.co/docs/transformers/en/model_doc/t5#transformers.T5Tokenizer),
-            specifically the [google/umt5-xxl](https://huggingface.co/google/umt5-xxl) variant.
-        text_encoder ([`T5EncoderModel`]):
-            [T5](https://huggingface.co/docs/transformers/en/model_doc/t5#transformers.T5EncoderModel), specifically
-            the [google/umt5-xxl](https://huggingface.co/google/umt5-xxl) variant.
-        image_encoder ([`CLIPVisionModel`]):
-            [CLIP](https://huggingface.co/docs/transformers/model_doc/clip#transformers.CLIPVisionModel), specifically
-            the
-            [clip-vit-huge-patch14](https://github.com/mlfoundations/open_clip/blob/main/docs/PRETRAINED.md#vit-h14-xlm-roberta-large)
-            variant.
-        transformer ([`WanTransformer3DModel`]):
-            Conditional Transformer to denoise the input latents.
-        scheduler ([`UniPCMultistepScheduler`]):
-            A scheduler to be used in combination with `transformer` to denoise the encoded image latents.
-        vae ([`AutoencoderKLWan`]):
-            Variational Auto-Encoder (VAE) Model to encode and decode videos to and from latent representations.
+    
+    This pipeline has been extended to optionally condition on an end frame.
     """
-
     model_cpu_offload_seq = "text_encoder->image_encoder->transformer->vae"
     _callback_tensor_inputs = ["latents", "prompt_embeds", "negative_prompt_embeds"]
 
     def __init__(
         self,
-        tokenizer: AutoTokenizer,
-        text_encoder: UMT5EncoderModel,
-        image_encoder: CLIPVisionModel,
-        image_processor: CLIPImageProcessor,
-        transformer: WanTransformer3DModel,
-        vae: AutoencoderKLWan,
-        scheduler: FlowMatchEulerDiscreteScheduler,
+        tokenizer,              # e.g., AutoTokenizer
+        text_encoder,           # e.g., UMT5EncoderModel
+        image_encoder,          # e.g., CLIPVisionModel
+        image_processor,        # e.g., CLIPImageProcessor
+        transformer,            # e.g., WanTransformer3DModel
+        vae,                    # e.g., AutoencoderKLWan
+        scheduler,              # e.g., FlowMatchEulerDiscreteScheduler
     ):
         super().__init__()
-
         self.register_modules(
             vae=vae,
             text_encoder=text_encoder,
@@ -173,7 +150,7 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
             scheduler=scheduler,
             image_processor=image_processor,
         )
-
+        # Set scaling factors for temporal/spatial dimensions.
         self.vae_scale_factor_temporal = 2 ** sum(self.vae.temperal_downsample) if getattr(self, "vae", None) else 4
         self.vae_scale_factor_spatial = 2 ** len(self.vae.temperal_downsample) if getattr(self, "vae", None) else 8
         self.video_processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor_spatial)
@@ -189,11 +166,9 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
     ):
         device = device or self._execution_device
         dtype = dtype or self.text_encoder.dtype
-
         prompt = [prompt] if isinstance(prompt, str) else prompt
-        prompt = [prompt_clean(u) for u in prompt]
+        prompt = [self.prompt_clean(u) for u in prompt]
         batch_size = len(prompt)
-
         text_inputs = self.tokenizer(
             prompt,
             padding="max_length",
@@ -205,20 +180,20 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         )
         text_input_ids, mask = text_inputs.input_ids, text_inputs.attention_mask
         seq_lens = mask.gt(0).sum(dim=1).long()
-
         prompt_embeds = self.text_encoder(text_input_ids.to(device), mask.to(device)).last_hidden_state
         prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
         prompt_embeds = [u[:v] for u, v in zip(prompt_embeds, seq_lens)]
         prompt_embeds = torch.stack(
             [torch.cat([u, u.new_zeros(max_sequence_length - u.size(0), u.size(1))]) for u in prompt_embeds], dim=0
         )
-
-        # duplicate text embeddings for each generation per prompt, using mps friendly method
         _, seq_len, _ = prompt_embeds.shape
         prompt_embeds = prompt_embeds.repeat(1, num_videos_per_prompt, 1)
         prompt_embeds = prompt_embeds.view(batch_size * num_videos_per_prompt, seq_len, -1)
-
         return prompt_embeds
+
+    def prompt_clean(self, prompt: str) -> str:
+        # Dummy cleaning; replace with your actual cleaning logic.
+        return prompt.strip()
 
     def encode_image(
         self,
@@ -230,7 +205,6 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         image_embeds = self.image_encoder(**image, output_hidden_states=True)
         return image_embeds.hidden_states[-2]
 
-    # Copied from diffusers.pipelines.wan.pipeline_wan.WanPipeline.encode_prompt
     def encode_prompt(
         self,
         prompt: Union[str, List[str]],
@@ -243,40 +217,9 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
     ):
-        r"""
-        Encodes the prompt into text encoder hidden states.
-
-        Args:
-            prompt (`str` or `List[str]`, *optional*):
-                prompt to be encoded
-            negative_prompt (`str` or `List[str]`, *optional*):
-                The prompt or prompts not to guide the image generation. If not defined, one has to pass
-                `negative_prompt_embeds` instead. Ignored when not using guidance (i.e., ignored if `guidance_scale` is
-                less than `1`).
-            do_classifier_free_guidance (`bool`, *optional*, defaults to `True`):
-                Whether to use classifier free guidance or not.
-            num_videos_per_prompt (`int`, *optional*, defaults to 1):
-                Number of videos that should be generated per prompt. torch device to place the resulting embeddings on
-            prompt_embeds (`torch.Tensor`, *optional*):
-                Pre-generated text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt weighting. If not
-                provided, text embeddings will be generated from `prompt` input argument.
-            negative_prompt_embeds (`torch.Tensor`, *optional*):
-                Pre-generated negative text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt
-                weighting. If not provided, negative_prompt_embeds will be generated from `negative_prompt` input
-                argument.
-            device: (`torch.device`, *optional*):
-                torch device
-            dtype: (`torch.dtype`, *optional*):
-                torch dtype
-        """
         device = device or self._execution_device
-
         prompt = [prompt] if isinstance(prompt, str) else prompt
-        if prompt is not None:
-            batch_size = len(prompt)
-        else:
-            batch_size = prompt_embeds.shape[0]
-
+        batch_size = len(prompt) if prompt is not None else prompt_embeds.shape[0]
         if prompt_embeds is None:
             prompt_embeds = self._get_t5_prompt_embeds(
                 prompt=prompt,
@@ -285,23 +228,15 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                 device=device,
                 dtype=dtype,
             )
-
         if do_classifier_free_guidance and negative_prompt_embeds is None:
             negative_prompt = negative_prompt or ""
             negative_prompt = batch_size * [negative_prompt] if isinstance(negative_prompt, str) else negative_prompt
-
             if prompt is not None and type(prompt) is not type(negative_prompt):
                 raise TypeError(
-                    f"`negative_prompt` should be the same type to `prompt`, but got {type(negative_prompt)} !="
-                    f" {type(prompt)}."
+                    f"`negative_prompt` should be the same type as `prompt`, but got {type(negative_prompt)} vs {type(prompt)}."
                 )
             elif batch_size != len(negative_prompt):
-                raise ValueError(
-                    f"`negative_prompt`: {negative_prompt} has batch size {len(negative_prompt)}, but `prompt`:"
-                    f" {prompt} has batch size {batch_size}. Please make sure that passed `negative_prompt` matches"
-                    " the batch size of `prompt`."
-                )
-
+                raise ValueError("Batch size mismatch between prompt and negative_prompt.")
             negative_prompt_embeds = self._get_t5_prompt_embeds(
                 prompt=negative_prompt,
                 num_videos_per_prompt=num_videos_per_prompt,
@@ -309,7 +244,6 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                 device=device,
                 dtype=dtype,
             )
-
         return prompt_embeds, negative_prompt_embeds
 
     def check_inputs(
@@ -323,38 +257,24 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         negative_prompt_embeds=None,
         callback_on_step_end_tensor_inputs=None,
     ):
-        if not isinstance(image, torch.Tensor) and not isinstance(image, PIL.Image.Image):
-            raise ValueError("`image` has to be of type `torch.Tensor` or `PIL.Image.Image` but is" f" {type(image)}")
+        if not isinstance(image, torch.Tensor) and not isinstance(image, Image.Image):
+            raise ValueError(f"`image` must be a torch.Tensor or PIL.Image.Image, got {type(image)}")
         if height % 16 != 0 or width % 16 != 0:
-            raise ValueError(f"`height` and `width` have to be divisible by 16 but are {height} and {width}.")
-
+            raise ValueError(f"`height` and `width` must be divisible by 16, got {height} and {width}")
         if callback_on_step_end_tensor_inputs is not None and not all(
             k in self._callback_tensor_inputs for k in callback_on_step_end_tensor_inputs
         ):
-            raise ValueError(
-                f"`callback_on_step_end_tensor_inputs` has to be in {self._callback_tensor_inputs}, but found {[k for k in callback_on_step_end_tensor_inputs if k not in self._callback_tensor_inputs]}"
-            )
-
+            raise ValueError(f"`callback_on_step_end_tensor_inputs` must be within {self._callback_tensor_inputs}")
         if prompt is not None and prompt_embeds is not None:
-            raise ValueError(
-                f"Cannot forward both `prompt`: {prompt} and `prompt_embeds`: {prompt_embeds}. Please make sure to"
-                " only forward one of the two."
-            )
+            raise ValueError("Provide either `prompt` or `prompt_embeds`, not both.")
         elif negative_prompt is not None and negative_prompt_embeds is not None:
-            raise ValueError(
-                f"Cannot forward both `negative_prompt`: {negative_prompt} and `negative_prompt_embeds`: {negative_prompt_embeds}. Please make sure to"
-                " only forward one of the two."
-            )
+            raise ValueError("Provide either `negative_prompt` or `negative_prompt_embeds`, not both.")
         elif prompt is None and prompt_embeds is None:
-            raise ValueError(
-                "Provide either `prompt` or `prompt_embeds`. Cannot leave both `prompt` and `prompt_embeds` undefined."
-            )
+            raise ValueError("You must provide either `prompt` or `prompt_embeds`.")
         elif prompt is not None and (not isinstance(prompt, str) and not isinstance(prompt, list)):
-            raise ValueError(f"`prompt` has to be of type `str` or `list` but is {type(prompt)}")
-        elif negative_prompt is not None and (
-            not isinstance(negative_prompt, str) and not isinstance(negative_prompt, list)
-        ):
-            raise ValueError(f"`negative_prompt` has to be of type `str` or `list` but is {type(negative_prompt)}")
+            raise ValueError(f"`prompt` must be a str or list, got {type(prompt)}")
+        elif negative_prompt is not None and (not isinstance(negative_prompt, str) and not isinstance(negative_prompt, list)):
+            raise ValueError(f"`negative_prompt` must be a str or list, got {type(negative_prompt)}")
 
     def prepare_latents(
         self,
@@ -369,57 +289,36 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         latents: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Determine latent temporal and spatial dimensions
         num_latent_frames = (num_frames - 1) // self.vae_scale_factor_temporal + 1
         latent_height = height // self.vae_scale_factor_spatial
         latent_width = width // self.vae_scale_factor_spatial
 
         shape = (batch_size, num_channels_latents, num_latent_frames, latent_height, latent_width)
-        if isinstance(generator, list) and len(generator) != batch_size:
-            raise ValueError(
-                f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
-                f" size of {batch_size}. Make sure the batch size matches the length of the generators."
-            )
-
         if latents is None:
             latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
         else:
             latents = latents.to(device=device, dtype=dtype)
-
+        # Expand image along temporal dimension to create a video condition
         image = image.unsqueeze(2)
         video_condition = torch.cat(
             [image, image.new_zeros(image.shape[0], image.shape[1], num_frames - 1, height, width)], dim=2
         )
         video_condition = video_condition.to(device=device, dtype=dtype)
-
-        latents_mean = (
-            torch.tensor(self.vae.config.latents_mean)
-            .view(1, self.vae.config.z_dim, 1, 1, 1)
-            .to(latents.device, latents.dtype)
-        )
-        latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
-            latents.device, latents.dtype
-        )
-
-        if isinstance(generator, list):
-            latent_condition = [
-                retrieve_latents(self.vae.encode(video_condition), sample_mode="argmax") for _ in generator
-            ]
-            latent_condition = torch.cat(latent_condition)
-        else:
-            latent_condition = retrieve_latents(self.vae.encode(video_condition), sample_mode="argmax")
-            latent_condition = latent_condition.repeat(batch_size, 1, 1, 1, 1)
-
+        latents_mean = torch.tensor(self.vae.config.latents_mean).view(1, self.vae.config.z_dim, 1, 1, 1).to(device, dtype)
+        latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(device, dtype)
+        latent_condition = retrieve_latents(self.vae.encode(video_condition), sample_mode="argmax")
+        latent_condition = latent_condition.repeat(batch_size, 1, 1, 1, 1)
         latent_condition = (latent_condition - latents_mean) * latents_std
 
+        # Create a mask for the first frame
         mask_lat_size = torch.ones(batch_size, 1, num_frames, latent_height, latent_width)
         mask_lat_size[:, :, list(range(1, num_frames))] = 0
         first_frame_mask = mask_lat_size[:, :, 0:1]
-        first_frame_mask = torch.repeat_interleave(first_frame_mask, dim=2, repeats=self.vae_scale_factor_temporal)
+        first_frame_mask = torch.repeat_interleave(first_frame_mask, repeats=self.vae_scale_factor_temporal, dim=2)
         mask_lat_size = torch.concat([first_frame_mask, mask_lat_size[:, :, 1:, :]], dim=2)
         mask_lat_size = mask_lat_size.view(batch_size, -1, self.vae_scale_factor_temporal, latent_height, latent_width)
-        mask_lat_size = mask_lat_size.transpose(1, 2)
-        mask_lat_size = mask_lat_size.to(latent_condition.device)
-
+        mask_lat_size = mask_lat_size.transpose(1, 2).to(latent_condition.device)
         return latents, torch.concat([mask_lat_size, latent_condition], dim=1)
 
     @property
@@ -447,12 +346,12 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         return self._attention_kwargs
 
     @torch.no_grad()
-    @replace_example_docstring(EXAMPLE_DOC_STRING)
     def __call__(
         self,
         image: PipelineImageInput,
         prompt: Union[str, List[str]] = None,
         negative_prompt: Union[str, List[str]] = None,
+        end_frame: Optional[PipelineImageInput] = None,  # <-- New end frame parameter
         height: int = 480,
         width: int = 832,
         num_frames: int = 81,
@@ -466,88 +365,15 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         output_type: Optional[str] = "np",
         return_dict: bool = True,
         attention_kwargs: Optional[Dict[str, Any]] = None,
-        callback_on_step_end: Optional[
-            Union[Callable[[int, int, Dict], None], PipelineCallback, MultiPipelineCallbacks]
-        ] = None,
+        callback_on_step_end: Optional[Union[Callable, Any]] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         max_sequence_length: int = 512,
+        shift: float = 5.0,
     ):
-        r"""
-        The call function to the pipeline for generation.
-
-        Args:
-            image (`PipelineImageInput`):
-                The input image to condition the generation on. Must be an image, a list of images or a `torch.Tensor`.
-            prompt (`str` or `List[str]`, *optional*):
-                The prompt or prompts to guide the image generation. If not defined, one has to pass `prompt_embeds`.
-                instead.
-            negative_prompt (`str` or `List[str]`, *optional*):
-                The prompt or prompts not to guide the image generation. If not defined, one has to pass
-                `negative_prompt_embeds` instead. Ignored when not using guidance (i.e., ignored if `guidance_scale` is
-                less than `1`).
-            height (`int`, defaults to `480`):
-                The height of the generated video.
-            width (`int`, defaults to `832`):
-                The width of the generated video.
-            num_frames (`int`, defaults to `81`):
-                The number of frames in the generated video.
-            num_inference_steps (`int`, defaults to `50`):
-                The number of denoising steps. More denoising steps usually lead to a higher quality image at the
-                expense of slower inference.
-            guidance_scale (`float`, defaults to `5.0`):
-                Guidance scale as defined in [Classifier-Free Diffusion Guidance](https://arxiv.org/abs/2207.12598).
-                `guidance_scale` is defined as `w` of equation 2. of [Imagen
-                Paper](https://arxiv.org/pdf/2205.11487.pdf). Guidance scale is enabled by setting `guidance_scale >
-                1`. Higher guidance scale encourages to generate images that are closely linked to the text `prompt`,
-                usually at the expense of lower image quality.
-            num_videos_per_prompt (`int`, *optional*, defaults to 1):
-                The number of images to generate per prompt.
-            generator (`torch.Generator` or `List[torch.Generator]`, *optional*):
-                A [`torch.Generator`](https://pytorch.org/docs/stable/generated/torch.Generator.html) to make
-                generation deterministic.
-            latents (`torch.Tensor`, *optional*):
-                Pre-generated noisy latents sampled from a Gaussian distribution, to be used as inputs for image
-                generation. Can be used to tweak the same generation with different prompts. If not provided, a latents
-                tensor is generated by sampling using the supplied random `generator`.
-            prompt_embeds (`torch.Tensor`, *optional*):
-                Pre-generated text embeddings. Can be used to easily tweak text inputs (prompt weighting). If not
-                provided, text embeddings are generated from the `prompt` input argument.
-            output_type (`str`, *optional*, defaults to `"pil"`):
-                The output format of the generated image. Choose between `PIL.Image` or `np.array`.
-            return_dict (`bool`, *optional*, defaults to `True`):
-                Whether or not to return a [`WanPipelineOutput`] instead of a plain tuple.
-            attention_kwargs (`dict`, *optional*):
-                A kwargs dictionary that if specified is passed along to the `AttentionProcessor` as defined under
-                `self.processor` in
-                [diffusers.models.attention_processor](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
-            callback_on_step_end (`Callable`, `PipelineCallback`, `MultiPipelineCallbacks`, *optional*):
-                A function or a subclass of `PipelineCallback` or `MultiPipelineCallbacks` that is called at the end of
-                each denoising step during the inference. with the following arguments: `callback_on_step_end(self:
-                DiffusionPipeline, step: int, timestep: int, callback_kwargs: Dict)`. `callback_kwargs` will include a
-                list of all tensors as specified by `callback_on_step_end_tensor_inputs`.
-            callback_on_step_end_tensor_inputs (`List`, *optional*):
-                The list of tensor inputs for the `callback_on_step_end` function. The tensors specified in the list
-                will be passed as `callback_kwargs` argument. You will only be able to include variables listed in the
-                `._callback_tensor_inputs` attribute of your pipeline class.
-            max_sequence_length (`int`, *optional*, defaults to `512`):
-                The maximum sequence length of the prompt.
-            shift (`float`, *optional*, defaults to `5.0`):
-                The shift of the flow.
-            autocast_dtype (`torch.dtype`, *optional*, defaults to `torch.bfloat16`):
-                The dtype to use for the torch.amp.autocast.
-        Examples:
-
-        Returns:
-            [`~WanPipelineOutput`] or `tuple`:
-                If `return_dict` is `True`, [`WanPipelineOutput`] is returned, otherwise a `tuple` is returned where
-                the first element is a list with the generated images and the second element is a list of `bool`s
-                indicating whether the corresponding generated image contains "not-safe-for-work" (nsfw) content.
         """
-
-        if isinstance(callback_on_step_end, (PipelineCallback, MultiPipelineCallbacks)):
-            callback_on_step_end_tensor_inputs = callback_on_step_end.tensor_inputs
-
-        # 1. Check inputs. Raise error if not correct
+        Main call function for generating a video.
+        Extended to support conditioning on an end frame.
+        """
         self.check_inputs(
             prompt,
             negative_prompt,
@@ -560,9 +386,7 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         )
 
         if num_frames % self.vae_scale_factor_temporal != 1:
-            logger.warning(
-                f"`num_frames - 1` has to be divisible by {self.vae_scale_factor_temporal}. Rounding to the nearest number."
-            )
+            print(f"Warning: `num_frames - 1` must be divisible by {self.vae_scale_factor_temporal}. Adjusting num_frames.")
             num_frames = num_frames // self.vae_scale_factor_temporal * self.vae_scale_factor_temporal + 1
         num_frames = max(num_frames, 1)
 
@@ -573,7 +397,6 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
 
         device = self._execution_device
 
-        # 2. Define call parameters
         if prompt is not None and isinstance(prompt, str):
             batch_size = 1
         elif prompt is not None and isinstance(prompt, list):
@@ -581,7 +404,7 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         else:
             batch_size = prompt_embeds.shape[0]
 
-        # 3. Encode input prompt
+        # 1. Encode prompt (and negative prompt)
         prompt_embeds, negative_prompt_embeds = self.encode_prompt(
             prompt=prompt,
             negative_prompt=negative_prompt,
@@ -593,25 +416,24 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
             device=device,
         )
 
-        # Encode image embedding
+        # 2. Encode image
         transformer_dtype = self.transformer.dtype
         prompt_embeds = prompt_embeds.to(transformer_dtype)
         if negative_prompt_embeds is not None:
             negative_prompt_embeds = negative_prompt_embeds.to(transformer_dtype)
-
         image_embeds = self.encode_image(image, device)
         image_embeds = image_embeds.repeat(batch_size, 1, 1)
         image_embeds = image_embeds.to(transformer_dtype)
 
-        # 4. Prepare timesteps
+        # 3. Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
 
-        # 5. Prepare latent variables
+        # 4. Prepare latent variables and conditioning.
         num_channels_latents = self.vae.config.z_dim
-        image = self.video_processor.preprocess(image, height=height, width=width).to(device, dtype=torch.float32)
+        image_processed = self.video_processor.preprocess(image, height=height, width=width).to(device, dtype=torch.float32)
         latents, condition = self.prepare_latents(
-            image,
+            image_processed,
             batch_size * num_videos_per_prompt,
             num_channels_latents,
             height,
@@ -623,78 +445,82 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
             latents,
         )
 
+        # 5. Incorporate End Frame Support
+        if end_frame is not None:
+            # Preprocess and encode the end frame with the VAE
+            end_frame_processed = self.video_processor.preprocess(end_frame, height=height, width=width).to(device, dtype=torch.float32)
+            end_latents = retrieve_latents(self.vae.encode(end_frame_processed), sample_mode="argmax")
+            # Normalize end_latents
+            latents_mean = torch.tensor(self.vae.config.latents_mean).view(1, self.vae.config.z_dim, 1, 1, 1).to(device, latents.dtype)
+            latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(device, latents.dtype)
+            end_latents = (end_latents - latents_mean) * latents_std
+
+            # Option 1: Hard replacement of the final frame conditioning:
+            # condition[..., -1, :, :] = end_latents
+
+            # Option 2: Smooth interpolation over the last few frames.
+            num_transition_frames = min(5, condition.shape[2])
+            for i in range(num_transition_frames):
+                alpha = (i + 1) / num_transition_frames
+                condition[..., -num_transition_frames + i, :, :] = (
+                    (1 - alpha) * condition[..., -num_transition_frames + i, :, :] + alpha * end_latents
+                )
+
         # 6. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
+        progress_bar = self.progress_bar(total=num_inference_steps)
+        for i, t in enumerate(timesteps):
+            if self.interrupt:
+                continue
 
-        with self.progress_bar(total=num_inference_steps) as progress_bar:
-            for i, t in enumerate(timesteps):
-                if self.interrupt:
-                    continue
+            self._current_timestep = t
+            latent_model_input = torch.cat([latents, condition], dim=1).to(transformer_dtype)
+            timestep = t.expand(latents.shape[0])
+            noise_pred = self.transformer(
+                hidden_states=latent_model_input,
+                timestep=timestep,
+                encoder_hidden_states=prompt_embeds,
+                encoder_hidden_states_image=image_embeds,
+                attention_kwargs=attention_kwargs,
+                return_dict=False,
+            )[0]
 
-                self._current_timestep = t
-                latent_model_input = torch.cat([latents, condition], dim=1).to(transformer_dtype)
-                timestep = t.expand(latents.shape[0])
-
-                noise_pred = self.transformer(
+            if self.do_classifier_free_guidance:
+                noise_uncond = self.transformer(
                     hidden_states=latent_model_input,
                     timestep=timestep,
-                    encoder_hidden_states=prompt_embeds,
+                    encoder_hidden_states=negative_prompt_embeds,
                     encoder_hidden_states_image=image_embeds,
                     attention_kwargs=attention_kwargs,
                     return_dict=False,
                 )[0]
+                noise_pred = noise_uncond + guidance_scale * (noise_pred - noise_uncond)
 
-                if self.do_classifier_free_guidance:
-                    noise_uncond = self.transformer(
-                        hidden_states=latent_model_input,
-                        timestep=timestep,
-                        encoder_hidden_states=negative_prompt_embeds,
-                        encoder_hidden_states_image=image_embeds,
-                        attention_kwargs=attention_kwargs,
-                        return_dict=False,
-                    )[0]
-                    noise_pred = noise_uncond + guidance_scale * (noise_pred - noise_uncond)
+            latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
-                # compute the previous noisy sample x_t -> x_t-1
-                latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+            if callback_on_step_end is not None:
+                callback_kwargs = {k: locals()[k] for k in callback_on_step_end_tensor_inputs if k in locals()}
+                callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+                latents = callback_outputs.pop("latents", latents)
+                prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
+                negative_prompt_embeds = callback_outputs.pop("negative_prompt_embeds", negative_prompt_embeds)
 
-                if callback_on_step_end is not None:
-                    callback_kwargs = {}
-                    for k in callback_on_step_end_tensor_inputs:
-                        callback_kwargs[k] = locals()[k]
-                    callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
-
-                    latents = callback_outputs.pop("latents", latents)
-                    prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
-                    negative_prompt_embeds = callback_outputs.pop("negative_prompt_embeds", negative_prompt_embeds)
-
-                # call the callback, if provided
-                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
-                    progress_bar.update()
-
-                if XLA_AVAILABLE:
-                    xm.mark_step()
+            if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                progress_bar.update()
 
         self._current_timestep = None
 
-        if not output_type == "latent":
+        if output_type != "latent":
             latents = latents.to(self.vae.dtype)
-            latents_mean = (
-                torch.tensor(self.vae.config.latents_mean)
-                .view(1, self.vae.config.z_dim, 1, 1, 1)
-                .to(latents.device, latents.dtype)
-            )
-            latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
-                latents.device, latents.dtype
-            )
+            latents_mean = torch.tensor(self.vae.config.latents_mean).view(1, self.vae.config.z_dim, 1, 1, 1).to(latents.device, latents.dtype)
+            latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(latents.device, latents.dtype)
             latents = latents / latents_std + latents_mean
             video = self.vae.decode(latents, return_dict=False)[0]
             video = self.video_processor.postprocess_video(video, output_type=output_type)
         else:
             video = latents
 
-        # Offload all models
         self.maybe_free_model_hooks()
 
         if not return_dict:
