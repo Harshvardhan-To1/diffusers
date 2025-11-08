@@ -19,10 +19,7 @@ import urllib.parse as ul
 import warnings
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-import numpy as np
 import torch
-import PIL
-from PIL import Image
 from transformers import Gemma2PreTrainedModel, GemmaTokenizer, GemmaTokenizerFast
 
 from ...callbacks import MultiPipelineCallbacks, PipelineCallback
@@ -123,41 +120,6 @@ EXAMPLE_DOC_STRING = """
         ... ).frames[0]
 
         >>> export_to_video(output, "sana-video-output.mp4", fps=16)
-        ```
-
-        For text-image-to-video:
-        ```py
-        >>> import torch
-        >>> from diffusers import SanaVideoPipeline
-        >>> from diffusers.utils import export_to_video, load_image
-
-        >>> model_id = "Efficient-Large-Model/SANA-Video_2B_480p_diffusers"
-        >>> pipe = SanaVideoPipeline.from_pretrained(model_id)
-        >>> pipe.transformer.to(torch.bfloat16)
-        >>> pipe.text_encoder.to(torch.bfloat16)
-        >>> pipe.vae.to(torch.float32)
-        >>> pipe.to("cuda")
-        >>> model_score = 30
-
-        >>> prompt = "A woman stands against a stunning sunset backdrop, her long, wavy brown hair gently blowing in the breeze."
-        >>> negative_prompt = ""
-        >>> motion_prompt = f" motion score: {model_score}."
-        >>> prompt = prompt + motion_prompt
-        >>> init_image = load_image("path/to/initial_image.png")
-
-        >>> output = pipe(
-        ...     prompt=prompt,
-        ...     negative_prompt=negative_prompt,
-        ...     init_image=init_image,
-        ...     height=480,
-        ...     width=832,
-        ...     frames=81,
-        ...     guidance_scale=6,
-        ...     num_inference_steps=50,
-        ...     generator=torch.Generator(device="cuda").manual_seed(42),
-        ... ).frames[0]
-
-        >>> export_to_video(output, "sana-ti2v-output.mp4", fps=16)
         ```
 """
 
@@ -486,7 +448,6 @@ class SanaVideoPipeline(DiffusionPipeline, SanaLoraLoaderMixin):
         negative_prompt_embeds=None,
         prompt_attention_mask=None,
         negative_prompt_attention_mask=None,
-        init_image=None,
     ):
         if height % 32 != 0 or width % 32 != 0:
             raise ValueError(f"`height` and `width` have to be divisible by 32 but are {height} and {width}.")
@@ -540,12 +501,6 @@ class SanaVideoPipeline(DiffusionPipeline, SanaLoraLoaderMixin):
                     "`prompt_attention_mask` and `negative_prompt_attention_mask` must have the same shape when passed directly, but"
                     f" got: `prompt_attention_mask` {prompt_attention_mask.shape} != `negative_prompt_attention_mask`"
                     f" {negative_prompt_attention_mask.shape}."
-                )
-
-        if init_image is not None:
-            if not isinstance(init_image, (torch.Tensor, Image.Image, list)):
-                raise ValueError(
-                    f"`init_image` has to be of type `torch.Tensor`, `PIL.Image.Image` or list but is {type(init_image)}"
                 )
 
     # Copied from diffusers.pipelines.deepfloyd_if.pipeline_if.IFPipeline._text_preprocessing
@@ -764,7 +719,6 @@ class SanaVideoPipeline(DiffusionPipeline, SanaLoraLoaderMixin):
         prompt_attention_mask: Optional[torch.Tensor] = None,
         negative_prompt_embeds: Optional[torch.Tensor] = None,
         negative_prompt_attention_mask: Optional[torch.Tensor] = None,
-        init_image: Optional[Union[torch.Tensor, PIL.Image.Image, List[PIL.Image.Image]]] = None,
         output_type: Optional[str] = "pil",
         return_dict: bool = True,
         clean_caption: bool = False,
@@ -783,6 +737,8 @@ class SanaVideoPipeline(DiffusionPipeline, SanaLoraLoaderMixin):
             "Please generate only the enhanced description for the prompt below and avoid including any additional commentary or evaluations:",
             "User Prompt: ",
         ],
+        image: Optional[Union["PIL.Image.Image", List["PIL.Image.Image"]]] = None,
+        noise_multiplier: float = 0.0,
     ) -> Union[SanaVideoPipelineOutput, Tuple]:
         """
         Function invoked when calling the pipeline for generation.
@@ -839,9 +795,6 @@ class SanaVideoPipeline(DiffusionPipeline, SanaLoraLoaderMixin):
                 provided, negative_prompt_embeds will be generated from `negative_prompt` input argument.
             negative_prompt_attention_mask (`torch.Tensor`, *optional*):
                 Pre-generated attention mask for negative text embeddings.
-            init_image (`torch.Tensor` or `PIL.Image.Image` or `List[PIL.Image.Image]`, *optional*):
-                Image, or tensor representing an image batch, that will be used as the starting point for the
-                process (text-image-to-video generation). The first frame of the generated video will be conditioned on this image.
             output_type (`str`, *optional*, defaults to `"pil"`):
                 The output format of the generated video. Choose between mp4 or `np.array`.
             return_dict (`bool`, *optional*, defaults to `True`):
@@ -872,6 +825,10 @@ class SanaVideoPipeline(DiffusionPipeline, SanaLoraLoaderMixin):
             complex_human_instruction (`List[str]`, *optional*):
                 Instructions for complex human attention:
                 https://github.com/NVlabs/Sana/blob/main/configs/sana_app_config/Sana_1600M_app.yaml#L55.
+            image (`PIL.Image.Image` or `List[PIL.Image.Image]`, *optional*):
+                Image or images to condition the video generation on (for I2V mode). If provided, the first frame will be conditioned on this image.
+            noise_multiplier (`float`, *optional*, defaults to 0.0):
+                Amount of noise to add to the conditioning image frame (if `image` is provided).
 
         Examples:
 
@@ -905,7 +862,6 @@ class SanaVideoPipeline(DiffusionPipeline, SanaLoraLoaderMixin):
             negative_prompt_embeds,
             prompt_attention_mask,
             negative_prompt_attention_mask,
-            init_image=init_image,
         )
 
         self._guidance_scale = guidance_scale
@@ -967,39 +923,30 @@ class SanaVideoPipeline(DiffusionPipeline, SanaLoraLoaderMixin):
             latents,
         )
 
-        # Handle init_image for text-image-to-video
-        if init_image is not None:
-            # Preprocess init_image
-            if isinstance(init_image, Image.Image):
-                init_image = [init_image]
-            if isinstance(init_image, list):
-                init_image = [np.array(img.resize((width, height))) / 255.0 for img in init_image]
-                init_image = np.stack(init_image)
-                init_image = torch.from_numpy(init_image).permute(0, 3, 1, 2).float()
-            elif isinstance(init_image, np.ndarray):
-                if init_image.ndim == 3:
-                    init_image = init_image[None, ...]
-                init_image = torch.from_numpy(init_image).permute(0, 3, 1, 2).float()
-            else:
-                init_image = init_image
+        if image is not None:
+            from PIL import Image
 
-            # Repeat to match batch_size if necessary
-            if init_image.shape[0] < batch_size * num_videos_per_prompt:
-                init_image = init_image.repeat(batch_size * num_videos_per_prompt // init_image.shape[0], 1, 1, 1)
-
-            init_image = init_image.to(device=device, dtype=self.vae.dtype)
-            init_image = 2 * init_image - 1  # Assume normalization to [-1, 1]
-
-            init_image = init_image.unsqueeze(2)  # b, 3, 1, h, w
-
-            # Encode to latents
+            if not isinstance(image, list):
+                image = [image] * batch_size
+            if len(image) != batch_size:
+                raise ValueError(f"Number of images {len(image)} does not match batch_size {batch_size}")
+            image = [img.resize((width, height), Image.LANCZOS) if img.size != (width, height) else img for img in image]
+            image_tensor = self.video_processor.preprocess_image(image).to(device, self.vae.dtype)
+            image_tensor = image_tensor.unsqueeze(2)  # B C 1 H W
             with torch.no_grad():
-                encoded_image = self.vae.encode(init_image).latent_dist.mode()
-
-            encoded_image = encoded_image.to(dtype=latents.dtype)
-
-            # Set the first frame of latents to the encoded image
-            latents[:, :, 0, :, :] = encoded_image.squeeze(2)
+                encoder_output = self.vae.encode(image_tensor)
+                if hasattr(encoder_output, "latent_dist"):
+                    image_latents = encoder_output.latent_dist.sample()
+                else:
+                    image_latents = encoder_output.sample()
+            latents_mean = torch.tensor(self.vae.config.latents_mean).view(1, -1, 1, 1, 1).to(device, image_latents.dtype)
+            latents_std = torch.tensor(self.vae.config.latents_std).view(1, -1, 1, 1, 1).to(device, image_latents.dtype)
+            image_latents = (image_latents - latents_mean) / latents_std
+            image_latents = image_latents.repeat_interleave(num_videos_per_prompt, dim=0)
+            latents[:, :, 0:1, :, :] = image_latents
+            if noise_multiplier > 0:
+                noise = randn_tensor(image_latents.shape, generator=generator, device=device, dtype=latents.dtype)
+                latents[:, :, 0:1, :, :] += noise_multiplier * noise
 
         # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
@@ -1016,7 +963,7 @@ class SanaVideoPipeline(DiffusionPipeline, SanaLoraLoaderMixin):
 
                 latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
 
-                # Prepare timestep
+                # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                 timestep = t.expand(latent_model_input.shape[0])
 
                 # predict noise model_output
