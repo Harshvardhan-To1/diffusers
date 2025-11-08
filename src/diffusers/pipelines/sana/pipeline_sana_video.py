@@ -19,7 +19,9 @@ import urllib.parse as ul
 import warnings
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
+from PIL import Image
 from transformers import Gemma2PreTrainedModel, GemmaTokenizer, GemmaTokenizerFast
 
 from ...callbacks import MultiPipelineCallbacks, PipelineCallback
@@ -120,6 +122,41 @@ EXAMPLE_DOC_STRING = """
         ... ).frames[0]
 
         >>> export_to_video(output, "sana-video-output.mp4", fps=16)
+        ```
+
+        For text-image-to-video:
+        ```py
+        >>> import torch
+        >>> from diffusers import SanaVideoPipeline
+        >>> from diffusers.utils import export_to_video, load_image
+
+        >>> model_id = "Efficient-Large-Model/SANA-Video_2B_480p_diffusers"
+        >>> pipe = SanaVideoPipeline.from_pretrained(model_id)
+        >>> pipe.transformer.to(torch.bfloat16)
+        >>> pipe.text_encoder.to(torch.bfloat16)
+        >>> pipe.vae.to(torch.float32)
+        >>> pipe.to("cuda")
+        >>> model_score = 30
+
+        >>> prompt = "A woman stands against a stunning sunset backdrop, her long, wavy brown hair gently blowing in the breeze."
+        >>> negative_prompt = ""
+        >>> motion_prompt = f" motion score: {model_score}."
+        >>> prompt = prompt + motion_prompt
+        >>> init_image = load_image("path/to/initial_image.png")
+
+        >>> output = pipe(
+        ...     prompt=prompt,
+        ...     negative_prompt=negative_prompt,
+        ...     init_image=init_image,
+        ...     height=480,
+        ...     width=832,
+        ...     frames=81,
+        ...     guidance_scale=6,
+        ...     num_inference_steps=50,
+        ...     generator=torch.Generator(device="cuda").manual_seed(42),
+        ... ).frames[0]
+
+        >>> export_to_video(output, "sana-ti2v-output.mp4", fps=16)
         ```
 """
 
@@ -423,7 +460,7 @@ class SanaVideoPipeline(DiffusionPipeline, SanaLoraLoaderMixin):
     def prepare_extra_step_kwargs(self, generator, eta):
         # prepare extra kwargs for the scheduler step, since not all schedulers have the same signature
         # eta (η) is only used with the DDIMScheduler, it will be ignored for other schedulers.
-        # eta corresponds to η in DDIM paper: https://huggingface.co/papers/2010.02502
+        # eta corresponds to η in DDIM paper: https://arxiv.org/abs/2010.02502
         # and should be between [0, 1]
 
         accepts_eta = "eta" in set(inspect.signature(self.scheduler.step).parameters.keys())
@@ -448,6 +485,7 @@ class SanaVideoPipeline(DiffusionPipeline, SanaLoraLoaderMixin):
         negative_prompt_embeds=None,
         prompt_attention_mask=None,
         negative_prompt_attention_mask=None,
+        init_image=None,
     ):
         if height % 32 != 0 or width % 32 != 0:
             raise ValueError(f"`height` and `width` have to be divisible by 32 but are {height} and {width}.")
@@ -501,6 +539,12 @@ class SanaVideoPipeline(DiffusionPipeline, SanaLoraLoaderMixin):
                     "`prompt_attention_mask` and `negative_prompt_attention_mask` must have the same shape when passed directly, but"
                     f" got: `prompt_attention_mask` {prompt_attention_mask.shape} != `negative_prompt_attention_mask`"
                     f" {negative_prompt_attention_mask.shape}."
+                )
+
+        if init_image is not None:
+            if not isinstance(init_image, (torch.Tensor, Image.Image, list)):
+                raise ValueError(
+                    f"`init_image` has to be of type `torch.Tensor`, `PIL.Image.Image` or list but is {type(init_image)}"
                 )
 
     # Copied from diffusers.pipelines.deepfloyd_if.pipeline_if.IFPipeline._text_preprocessing
@@ -719,6 +763,7 @@ class SanaVideoPipeline(DiffusionPipeline, SanaLoraLoaderMixin):
         prompt_attention_mask: Optional[torch.Tensor] = None,
         negative_prompt_embeds: Optional[torch.Tensor] = None,
         negative_prompt_attention_mask: Optional[torch.Tensor] = None,
+        init_image: Optional[Union[torch.Tensor, PIL.Image.Image, List[PIL.Image.Image]]] = None,
         output_type: Optional[str] = "pil",
         return_dict: bool = True,
         clean_caption: bool = False,
@@ -762,8 +807,8 @@ class SanaVideoPipeline(DiffusionPipeline, SanaLoraLoaderMixin):
                 will be used.
             guidance_scale (`float`, *optional*, defaults to 4.5):
                 Guidance scale as defined in [Classifier-Free Diffusion
-                Guidance](https://huggingface.co/papers/2207.12598). `guidance_scale` is defined as `w` of equation 2.
-                of [Imagen Paper](https://huggingface.co/papers/2205.11487). Guidance scale is enabled by setting
+                Guidance](https://arxiv.org/abs/2207.12598). `guidance_scale` is defined as `w` of equation 2.
+                of [Imagen Paper](https://arxiv.org/abs/2205.11487). Guidance scale is enabled by setting
                 `guidance_scale > 1`. Higher guidance scale encourages to generate videos that are closely linked to
                 the text `prompt`, usually at the expense of lower video quality.
             num_videos_per_prompt (`int`, *optional*, defaults to 1):
@@ -775,7 +820,7 @@ class SanaVideoPipeline(DiffusionPipeline, SanaLoraLoaderMixin):
             frames (`int`, *optional*, defaults to 81):
                 The number of frames in the generated video.
             eta (`float`, *optional*, defaults to 0.0):
-                Corresponds to parameter eta (η) in the DDIM paper: https://huggingface.co/papers/2010.02502. Only
+                Corresponds to parameter eta (η) in the DDIM paper: https://arxiv.org/abs/2010.02502. Only
                 applies to [`schedulers.DDIMScheduler`], will be ignored for others.
             generator (`torch.Generator` or `List[torch.Generator]`, *optional*):
                 One or a list of [torch generator(s)](https://pytorch.org/docs/stable/generated/torch.Generator.html)
@@ -793,6 +838,9 @@ class SanaVideoPipeline(DiffusionPipeline, SanaLoraLoaderMixin):
                 provided, negative_prompt_embeds will be generated from `negative_prompt` input argument.
             negative_prompt_attention_mask (`torch.Tensor`, *optional*):
                 Pre-generated attention mask for negative text embeddings.
+            init_image (`torch.Tensor` or `PIL.Image.Image` or `List[PIL.Image.Image]`, *optional*):
+                Image, or tensor representing an image batch, that will be used as the starting point for the
+                process (text-image-to-video generation). The first frame of the generated video will be conditioned on this image.
             output_type (`str`, *optional*, defaults to `"pil"`):
                 The output format of the generated video. Choose between mp4 or `np.array`.
             return_dict (`bool`, *optional*, defaults to `True`):
@@ -856,6 +904,7 @@ class SanaVideoPipeline(DiffusionPipeline, SanaLoraLoaderMixin):
             negative_prompt_embeds,
             prompt_attention_mask,
             negative_prompt_attention_mask,
+            init_image=init_image,
         )
 
         self._guidance_scale = guidance_scale
@@ -917,6 +966,40 @@ class SanaVideoPipeline(DiffusionPipeline, SanaLoraLoaderMixin):
             latents,
         )
 
+        # Handle init_image for text-image-to-video
+        if init_image is not None:
+            # Preprocess init_image
+            if isinstance(init_image, Image.Image):
+                init_image = [init_image]
+            if isinstance(init_image, list):
+                init_image = [np.array(img.resize((width, height))) / 255.0 for img in init_image]
+                init_image = np.stack(init_image)
+                init_image = torch.from_numpy(init_image).permute(0, 3, 1, 2).float()
+            elif isinstance(init_image, np.ndarray):
+                if init_image.ndim == 3:
+                    init_image = init_image[None, ...]
+                init_image = torch.from_numpy(init_image).permute(0, 3, 1, 2).float()
+            else:
+                init_image = init_image
+
+            # Repeat to match batch_size if necessary
+            if init_image.shape[0] < batch_size * num_videos_per_prompt:
+                init_image = init_image.repeat(batch_size * num_videos_per_prompt // init_image.shape[0], 1, 1, 1)
+
+            init_image = init_image.to(device=device, dtype=self.vae.dtype)
+            init_image = 2 * init_image - 1  # Assume normalization to [-1, 1]
+
+            init_image = init_image.unsqueeze(2)  # b, 3, 1, h, w
+
+            # Encode to latents
+            with torch.no_grad():
+                encoded_image = self.vae.encode(init_image).latent_dist.mode()
+
+            encoded_image = encoded_image.to(dtype=latents.dtype)
+
+            # Set the first frame of latents to the encoded image
+            latents[:, :, 0, :, :] = encoded_image.squeeze(2)
+
         # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
@@ -932,8 +1015,21 @@ class SanaVideoPipeline(DiffusionPipeline, SanaLoraLoaderMixin):
 
                 latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
 
-                # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
+                # Prepare timestep
                 timestep = t.expand(latent_model_input.shape[0])
+
+                if init_image is not None:
+                    # Create per-frame timestep tensor
+                    timestep = timestep[:, None, None, None, None].expand(
+                        latent_model_input.shape[0],
+                        latent_model_input.shape[1],
+                        latent_model_input.shape[2],
+                        latent_model_input.shape[3],
+                        latent_model_input.shape[4],
+                    )
+                    condition_mask = torch.zeros_like(latent_model_input)
+                    condition_mask[:, :, 0, :, :] = 1
+                    timestep = timestep * (1 - condition_mask)
 
                 # predict noise model_output
                 noise_pred = self.transformer(
