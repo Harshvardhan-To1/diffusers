@@ -931,7 +931,17 @@ class SanaVideoPipeline(DiffusionPipeline, SanaLoraLoaderMixin):
             if len(image) != batch_size:
                 raise ValueError(f"Number of images {len(image)} does not match batch_size {batch_size}")
             image = [img.resize((width, height), Image.LANCZOS) if img.size != (width, height) else img for img in image]
-            image_tensor = self.video_processor.preprocess_image(image).to(device, self.vae.dtype)
+            from torchvision import transforms
+            
+            # Assuming image is a list of PIL Images, already resized
+            
+            transform = transforms.Compose([
+                transforms.ToTensor(),  # Converts to tensor in [0, 1], shape C H W
+                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])  # Normalizes to [-1, 1]
+            ])
+            
+            image_tensors = [transform(img) for img in image]
+            image_tensor = torch.stack(image_tensors).to(device, self.vae.dtype)
             image_tensor = image_tensor.unsqueeze(2)  # B C 1 H W
             with torch.no_grad():
                 encoder_output = self.vae.encode(image_tensor)
