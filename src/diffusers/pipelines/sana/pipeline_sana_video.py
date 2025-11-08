@@ -1019,19 +1019,6 @@ class SanaVideoPipeline(DiffusionPipeline, SanaLoraLoaderMixin):
                 # Prepare timestep
                 timestep = t.expand(latent_model_input.shape[0])
 
-                if init_image is not None:
-                    # Create per-frame timestep tensor
-                    timestep = timestep[:, None, None, None, None].expand(
-                        latent_model_input.shape[0],
-                        latent_model_input.shape[1],
-                        latent_model_input.shape[2],
-                        latent_model_input.shape[3],
-                        latent_model_input.shape[4],
-                    )
-                    condition_mask = torch.zeros_like(latent_model_input)
-                    condition_mask[:, :, 0, :, :] = 1
-                    timestep = timestep * (1 - condition_mask)
-
                 # predict noise model_output
                 noise_pred = self.transformer(
                     latent_model_input.to(dtype=transformer_dtype),
